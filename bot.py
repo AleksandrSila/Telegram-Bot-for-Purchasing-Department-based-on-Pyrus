@@ -6,6 +6,8 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -75,6 +77,81 @@ def format_task_brief(task) -> str:
     )
 
 
+# Клавиатура с кнопками "Отправить" и "Назад" снизу — только в режиме приёма/передачи
+SEND_KEYBOARD = ReplyKeyboardMarkup(
+    [["Отправить", "Назад"]],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+WELCOME_TEXT = (
+    "👋 Добро пожаловать в бот управления закупками!\n\n"
+    "Здесь вы можете:\n"
+    "• найти закупку по контрагенту, сумме или названию\n"
+    "• оприходовать товар — прикрепить фото и комментарий\n"
+    "• передать/получить товар — прикрепить фото и комментарий\n\n"
+    "Выберите закупку для начала работы."
+)
+
+
+async def do_send(user_id: int, reply_func) -> bool:
+    """Общая логика отправки комментария."""
+    buf = user_comment_buffers.get(user_id)
+    if not buf or not buf["text"] or not buf["photos"]:
+        await reply_func(
+            "Нужны и фото, и текст.\n"
+            f"- текст: {'да' if buf and buf['text'] else 'нет'}\n"
+            f"- фото: {'да' if buf and buf['photos'] else 'нет'}\n\n"
+            "Отправьте недостающее и нажмите «Отправить» снова.",
+            reply_markup=SEND_KEYBOARD,
+        )
+        return False
+
+    task_id = user_selected_task.get(user_id)
+    if not task_id:
+        await reply_func("Сначала выберите закупку.", reply_markup=SEND_KEYBOARD)
+        return False
+
+    mode = buf["mode"]
+    prefix = "Оприходование" if mode == "receive" else "Передача"
+    full_text = f"{prefix}:\n{buf['text']}"
+
+    try:
+        pyrus.add_comment(task_id, full_text, file_guids=buf["photos"])
+    except Exception as e:
+        logger.exception("Ошибка при добавлении комментария")
+        await reply_func(
+            f"Ошибка при добавлении комментария: {e}",
+            reply_markup=SEND_KEYBOARD,
+        )
+        return False
+
+    return True
+
+
+async def return_to_task_card(send_func, user_id: int):
+    """Возврат к карточке закупки с удалением нижней клавиатуры."""
+    task_id = user_selected_task.get(user_id)
+    task = pyrus.get_task_brief(task_id) if task_id else None
+    set_state(user_id, State.TASK_SELECTED)
+
+    keyboard = [
+        [InlineKeyboardButton("Оприходовать", callback_data="task_action:receive")],
+        [InlineKeyboardButton("Передать/Получить", callback_data="task_action:transfer")],
+        [InlineKeyboardButton("Назад", callback_data="task_action:back")],
+    ]
+    if task:
+        await send_func(
+            format_task_brief(task),
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await send_func(
+            "Закупка не найдена. Нажмите /start.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     set_state(user_id, State.IDLE)
@@ -86,13 +163,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Ввести ID", callback_data="main:enter_id")],
     ]
     await update.message.reply_text(
-        "Выберите закупку для оприходования или передачи.\n"
-        "Введите ID или воспользуйтесь поиском.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        WELCOME_TEXT,
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await update.message.reply_text(
+        "Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /send — дублирует кнопку «Отправить»."""
     user_id = update.effective_user.id
     state = get_state(user_id)
 
@@ -102,45 +183,18 @@ async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    buf = user_comment_buffers.get(user_id)
-    if not buf or not buf["text"] or not buf["photos"]:
-        await update.message.reply_text(
-            "Нужны и фото, и текст.\n"
-            f"- текст: {'да' if buf and buf['text'] else 'нет'}\n"
-            f"- фото: {'да' if buf and buf['photos'] else 'нет'}\n\n"
-            "Отправьте недостающее и снова нажмите /send."
-        )
+    async def reply(text, **kwargs):
+        await update.message.reply_text(text, **kwargs)
+
+    success = await do_send(user_id, reply)
+    if not success:
         return
 
-    task_id = user_selected_task.get(user_id)
-    if not task_id:
-        await update.message.reply_text("Сначала выберите закупку.")
-        return
-
-    mode = buf["mode"]
-    prefix = "Оприходование" if mode == "receive" else "Передача"
-    full_text = f"{prefix}:\n{buf['text']}"
-
-    try:
-        pyrus.add_comment(task_id, full_text, file_guids=buf["photos"])
-    except Exception as e:
-        logger.exception("Ошибка при добавлении комментария")
-        await update.message.reply_text(f"Ошибка при добавлении комментария: {e}")
-        return
-
-    await update.message.reply_text("Комментарий с фото добавлен в Pyrus.")
-
-    task = pyrus.get_task_brief(task_id)
-    set_state(user_id, State.TASK_SELECTED)
-    keyboard = [
-        [InlineKeyboardButton("Оприходовать", callback_data="task_action:receive")],
-        [InlineKeyboardButton("Передать", callback_data="task_action:transfer")],
-        [InlineKeyboardButton("Назад", callback_data="task_action:back")],
-    ]
     await update.message.reply_text(
-        format_task_brief(task),
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        "Комментарий с фото добавлен в Pyrus.",
+        reply_markup=ReplyKeyboardRemove(),
     )
+    await return_to_task_card(update.message.reply_text, user_id)
 
 
 async def handle_main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,7 +227,7 @@ async def handle_main_menu_callback(update: Update, context: ContextTypes.DEFAUL
             [InlineKeyboardButton("Ввести ID", callback_data="main:enter_id")],
         ]
         await query.edit_message_text(
-            "Выберите закупку для оприходования или передачи.\nВведите ID или воспользуйтесь поиском.",
+            "Выберите действие:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
@@ -215,7 +269,7 @@ async def handle_task_action_callback(update: Update, context: ContextTypes.DEFA
 
         keyboard = [
             [InlineKeyboardButton("Оприходовать", callback_data="task_action:receive")],
-            [InlineKeyboardButton("Передать", callback_data="task_action:transfer")],
+            [InlineKeyboardButton("Передать/Получить", callback_data="task_action:transfer")],
             [InlineKeyboardButton("Назад", callback_data="task_action:back")],
         ]
         await query.edit_message_text(
@@ -233,7 +287,7 @@ async def handle_task_action_callback(update: Update, context: ContextTypes.DEFA
                 [InlineKeyboardButton("Ввести ID", callback_data="main:enter_id")],
             ]
             await query.edit_message_text(
-                "Выберите закупку для оприходования или передачи.\nВведите ID или воспользуйтесь поиском.",
+                "Выберите действие:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             return
@@ -246,21 +300,21 @@ async def handle_task_action_callback(update: Update, context: ContextTypes.DEFA
         if action == "receive":
             set_state(user_id, State.AWAIT_RECEIVE_COMMENT)
             reset_comment_buffer(user_id, mode="receive")
-            await query.edit_message_text(
+            await query.message.reply_text(
                 "Режим: ОПРИХОДОВАТЬ.\n"
-                "Отправьте фото и текст.\n"
-                "Можно одним сообщением (фото с подписью) или по отдельности.\n"
-                "Когда всё готово — нажмите /send."
+                "Отправьте фото и текст (можно одним сообщением — фото с подписью).\n"
+                "Когда всё готово — нажмите «Отправить».",
+                reply_markup=SEND_KEYBOARD,
             )
 
         elif action == "transfer":
             set_state(user_id, State.AWAIT_TRANSFER_COMMENT)
             reset_comment_buffer(user_id, mode="transfer")
-            await query.edit_message_text(
-                "Режим: ПЕРЕДАТЬ.\n"
-                "Отправьте фото и текст.\n"
-                "Можно одним сообщением (фото с подписью) или по отдельности.\n"
-                "Когда всё готово — нажмите /send."
+            await query.message.reply_text(
+                "Режим: ПЕРЕДАТЬ/ПОЛУЧИТЬ.\n"
+                "Отправьте фото и текст (можно одним сообщением — фото с подписью).\n"
+                "Когда всё готово — нажмите «Отправить».",
+                reply_markup=SEND_KEYBOARD,
             )
 
 
@@ -273,7 +327,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = text.strip() if text else ""
     has_photo = bool(msg.photo)
 
-    # --- режимы ОПРИХОДОВАТЬ / ПЕРЕДАТЬ: только накапливаем ---
+    # --- режимы ОПРИХОДОВАТЬ / ПЕРЕДАТЬ ---
     if state in (State.AWAIT_RECEIVE_COMMENT, State.AWAIT_TRANSFER_COMMENT):
         buf = user_comment_buffers.get(user_id)
         if not buf:
@@ -281,15 +335,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reset_comment_buffer(user_id, mode)
             buf = user_comment_buffers[user_id]
 
+        # кнопка "Назад" — возврат к карточке без отправки
+        if text == "Назад":
+            await msg.reply_text(
+                "Возврат к карточке закупки.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await return_to_task_card(msg.reply_text, user_id)
+            return
+
+        # кнопка "Отправить"
+        if text == "Отправить":
+            async def reply(t, **kwargs):
+                await msg.reply_text(t, **kwargs)
+
+            success = await do_send(user_id, reply)
+            if not success:
+                return
+
+            await msg.reply_text(
+                "Комментарий с фото добавлен в Pyrus.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await return_to_task_card(msg.reply_text, user_id)
+            return
+
+        # накапливаем фото
         if has_photo:
             photo = msg.photo[-1]
             file = await photo.get_file()
             file_bytes = await file.download_as_bytearray()
             guid = pyrus.upload_file(file_bytes, f"{file.file_unique_id}.jpg")
-            logger.info(f"Uploaded photo guid={guid}, buffer photos before: {buf['photos']}")
+            logger.info(f"Uploaded photo guid={guid}")
             buf["photos"].append(guid)
-            logger.info(f"Buffer photos after: {buf['photos']}")
 
+        # накапливаем текст (включая подпись к фото)
         if text:
             if buf["text"]:
                 buf["text"] += "\n" + text
@@ -300,7 +380,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Данные сохранены.\n"
             f"Сейчас в буфере: текст={'да' if buf['text'] else 'нет'}, "
             f"фото={len(buf['photos'])} шт.\n"
-            "Когда всё готово — нажмите /send."
+            "Когда всё готово — нажмите «Отправить».",
+            reply_markup=SEND_KEYBOARD,
         )
         return
 
@@ -318,7 +399,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_state(user_id, State.TASK_SELECTED)
         keyboard = [
             [InlineKeyboardButton("Оприходовать", callback_data="task_action:receive")],
-            [InlineKeyboardButton("Передать", callback_data="task_action:transfer")],
+            [InlineKeyboardButton("Передать/Получить", callback_data="task_action:transfer")],
             [InlineKeyboardButton("Назад", callback_data="task_action:back")],
         ]
         await msg.reply_text(
